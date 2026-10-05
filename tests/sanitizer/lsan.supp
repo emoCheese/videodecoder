@@ -1,0 +1,11 @@
+# LeakSanitizer 抑制：第三方库（FFmpeg / Qt）内部的一次性分配不属于本项目代码，
+# 本项目的泄漏（Pipeline/Decoder/Demuxer/VideoWidget）不应出现在这里。
+leak:libavcodec
+leak:libavformat
+leak:libavutil
+leak:libswscale
+leak:libswresample
+leak:libQt6
+leak:libqxcb
+leak:libGLX
+leak:libEGL

@@ -1,0 +1,20 @@
+# ThreadSanitizer 抑制：Qt 平台插件与 FFmpeg 均未用 TSan 插桩，
+# 其内部同步会产生已知噪声，而本项目关心的是自己的线程模型
+# （RingBuffer 阻塞/唤醒、Demuxer→Decoder 队列、解码线程→GUI 线程投递）。
+# 实测：GUI 运行时剩余报告全部来自 Qt 依赖的 dbus/glib（见下），本项目源码零报告。
+# 若怀疑真实竞争，先删掉对应行再复现。
+race:libQt6
+race:libqxcb
+race:QGuiApplication
+race:QCoreApplication
+race:QThreadStorage
+race:libavcodec
+race:libavformat
+race:libavutil
+race:libswscale
+race:libdbus-1
+race:libglib-2.0
+race:libgobject-2.0
+race:gdbus
+race:libfontconfig
+race:libpangoft2
