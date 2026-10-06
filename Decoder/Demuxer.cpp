@@ -10,7 +10,7 @@ extern "C" {
 #include <libavutil/error.h>
 }
 
-#include "FfmpegError.h"
+#include "FFmpegError.h"
 
 namespace {
 

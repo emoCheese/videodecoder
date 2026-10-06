@@ -1,5 +1,6 @@
 #pragma once
 
+#include <format>
 extern "C" {
 #include <libavutil/error.h>
 }
@@ -19,7 +20,7 @@ namespace ffmpeg_error {
 {
     std::array<char, AV_ERROR_MAX_STRING_SIZE> buffer{};
     if (av_strerror(error, buffer.data(), buffer.size()) < 0) {
-        return "未知错误(" + std::to_string(error) + ")";
+        return std::format("未知错误({})", std::to_string(error));
     }
     return std::string(buffer.data());
 }

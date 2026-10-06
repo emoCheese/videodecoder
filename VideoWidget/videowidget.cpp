@@ -225,19 +225,45 @@ bool VideoWidget::uploadFrame(const videoframe::Nv12FrameView& view)
 
     ensureTextures(view);
 
-    // Y 平面（width x height）
-    glBindTexture(GL_TEXTURE_2D, m_texY);
-    for (int row = 0; row < view.height; ++row) {
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, row, view.width, 1, GL_RED, GL_UNSIGNED_BYTE,
-                        view.y.data + static_cast<std::ptrdiff_t>(row) * view.y.stride);
-    }
+    // 保存原有 pixel store 状态，避免污染其他代码
+    GLint oldAlign = 4;
+    GLint oldRowLength = 0;
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &oldAlign);
+    glGetIntegerv(GL_UNPACK_ROW_LENGTH, &oldRowLength);
 
-    // UV 平面（width/2 x height/2，交错）
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+    // Y 平面：一次上传整帧
+    glBindTexture(GL_TEXTURE_2D, m_texY);
+
+    // Y 每像素 1 字节，所以 ROW_LENGTH 就是 stride 字节数
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, view.y.stride);
+
+    glTexSubImage2D(GL_TEXTURE_2D,
+                    0,
+                    0, 0,
+                    view.width, view.height,
+                    GL_RED,
+                    GL_UNSIGNED_BYTE,
+                    view.y.data);
+
+    // UV 平面：一次上传整个交错 UV 平面
     glBindTexture(GL_TEXTURE_2D, m_texUV);
-    for (int row = 0; row < view.height / 2; ++row) {
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, row, view.width / 2, 1, GL_RG, GL_UNSIGNED_BYTE,
-                        view.uv.data + static_cast<std::ptrdiff_t>(row) * view.uv.stride);
-    }
+
+    // GL_RG 每像素 2 字节，ROW_LENGTH 单位是像素数
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, view.uv.stride / 2);
+
+    glTexSubImage2D(GL_TEXTURE_2D,
+                    0,
+                    0, 0,
+                    view.width / 2, view.height / 2,
+                    GL_RG,
+                    GL_UNSIGNED_BYTE,
+                    view.uv.data);
+
+    // 恢复状态
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, oldRowLength);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, oldAlign);
 
     glBindTexture(GL_TEXTURE_2D, 0);
 

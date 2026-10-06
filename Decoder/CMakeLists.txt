@@ -24,7 +24,7 @@ add_library(Decoder STATIC
 	Decoder.cpp
 	PacketQueue.h
 	PacketData.h
-	FfmpegError.h
+	FFmpegError.h
 	RingBuffer.hpp
 )
 

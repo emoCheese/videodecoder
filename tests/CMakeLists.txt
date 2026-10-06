@@ -48,6 +48,27 @@ if(VD_FFMPEG_EXECUTABLE)
         TIMEOUT 120
         ENVIRONMENT "${VD_TEST_ENV}"
     )
+
+    # 回归素材：容器里放 rawvideo(NV12) 流 —— 解码输出**就是 NV12**，因此必然走
+    # Decoder“源格式已是目标格式”这条分支。历史上该分支被交给 swscale 做
+    # NV12→NV12 同尺寸转换，命中其只拷亮度、不写色度的快速通道，画面整幅发绿。
+    # 素材由随机 RGB 转成 NV12，色度必然非常量，故可用 --require-chroma 精确判定。
+    set(VD_TEST_MEDIA_NV12 "${VD_TEST_MEDIA_DIR}/vd_test_nv12.mkv")
+    add_test(NAME generate_test_media_nv12
+        COMMAND "${VD_FFMPEG_EXECUTABLE}" -hide_banner -loglevel error -y
+                -f rawvideo -pix_fmt rgb24 -s 64x48 -i /dev/urandom -frames:v 16
+                -pix_fmt nv12 -c:v rawvideo "${VD_TEST_MEDIA_NV12}"
+    )
+    set_tests_properties(generate_test_media_nv12 PROPERTIES FIXTURES_SETUP vd_test_media_nv12 TIMEOUT 120)
+
+    add_test(NAME pipeline_smoke_nv12
+        COMMAND pipeline_smoke "${VD_TEST_MEDIA_NV12}" --frames 8 --require-chroma
+    )
+    set_tests_properties(pipeline_smoke_nv12 PROPERTIES
+        FIXTURES_REQUIRED vd_test_media_nv12
+        TIMEOUT 120
+        ENVIRONMENT "${VD_TEST_ENV}"
+    )
 else()
     message(STATUS "未找到 ffmpeg CLI：跳过自动生成素材的烟测（可用 pipeline_smoke 手动验收）")
 endif()

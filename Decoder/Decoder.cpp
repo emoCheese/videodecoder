@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <format>
 #include <memory>
+#include <string>
 #include <utility>
 
 extern "C" {
@@ -10,15 +12,117 @@ extern "C" {
 #include <libavcodec/codec_id.h>
 #include <libavcodec/codec_par.h>
 #include <libavutil/error.h>
+#include <libavutil/imgutils.h>  // av_image_copy_plane
 #include <libavutil/pixfmt.h>
 }
 
-#include "FfmpegError.h"
+#include "FFmpegError.h"
+
+namespace {
+
+/// 输出约定：NV12（UV 交错、宽高各半）+ 宽高偶数。
+constexpr AVPixelFormat kOutputFormat = AV_PIX_FMT_NV12;
+/// 输出帧缓冲对齐：与改造前 sws_scale 的输出保持一致。
+constexpr int kOutputAlign = 32;
+
+/// NVIDIA 硬件解码器名：<编码名>_cuvid（如 h264 → h264_cuvid）。
+/// 该编码没有对应实现（未编译进来）时返回 nullptr，由调用方回退软解。
+[[nodiscard]] const AVCodec* findCuvidDecoder(AVCodecID codecId)
+{
+    const AVCodecDescriptor* desc = avcodec_descriptor_get(codecId);
+    if (desc == nullptr || desc->name == nullptr) {
+        return nullptr;
+    }
+    const std::string hwName = std::format("{}_cuvid", desc->name);
+    return avcodec_find_decoder_by_name(hwName.c_str());
+}
+
+/// 是否是硬件帧：data[] 指向显存，必须先下载到主机内存再按主机内存解释。
+[[nodiscard]] bool isHardwareFrame(const AVFrame* frame) noexcept
+{
+    if (frame->hw_frames_ctx != nullptr) {
+        return true;
+    }
+    const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(frame->format));
+    return desc != nullptr && (desc->flags & AV_PIX_FMT_FLAG_HWACCEL) != 0;
+}
+
+/// swscale 入口的格式规整：YUVJ*（full range）按对应的 YUV* 处理，与改造前行为一致。
+[[nodiscard]] AVPixelFormat swscaleSourceFormat(AVPixelFormat format) noexcept
+{
+    switch (format) {
+        case AV_PIX_FMT_YUVJ420P:
+            return AV_PIX_FMT_YUV420P;
+        case AV_PIX_FMT_YUVJ422P:
+            return AV_PIX_FMT_YUV422P;
+        case AV_PIX_FMT_YUVJ444P:
+            return AV_PIX_FMT_YUV444P;
+        default:
+            return format;
+    }
+}
+
+void setError(std::string* error, std::string message)
+{
+    if (error != nullptr) {
+        *error = std::move(message);
+    }
+}
+
+}  // namespace
 
 Decoder::~Decoder()
 {
     stop();
     close();
+}
+
+AVCodecContext* Decoder::createContext(const AVCodec* codec, const AVStream* stream,
+                                       AVHWDeviceType deviceType, std::string* error)
+{
+    AVCodecContext* ctx = avcodec_alloc_context3(codec);
+    if (ctx == nullptr) {
+        setError(error, "avcodec_alloc_context3 失败");
+        return nullptr;
+    }
+
+    const int paramsRet = avcodec_parameters_to_context(ctx, stream->codecpar);
+    if (paramsRet < 0) {
+        setError(error, "复制解码参数失败: " + ffmpeg_error::toString(paramsRet));
+        avcodec_free_context(&ctx);
+        return nullptr;
+    }
+
+    if (deviceType != AV_HWDEVICE_TYPE_NONE) {
+        AVBufferRef* device = nullptr;
+        const int deviceRet = av_hwdevice_ctx_create(&device, deviceType, nullptr, nullptr, 0);
+        if (deviceRet < 0) {
+            setError(error, "创建硬件设备上下文失败: " + ffmpeg_error::toString(deviceRet));
+            avcodec_free_context(&ctx);
+            return nullptr;
+        }
+        // 设备归属解码上下文（avcodec_free_context 负责释放），本地引用随即归还。
+        ctx->hw_device_ctx = av_buffer_ref(device);
+        av_buffer_unref(&device);
+        if (ctx->hw_device_ctx == nullptr) {
+            setError(error, "绑定硬件设备上下文失败");
+            avcodec_free_context(&ctx);
+            return nullptr;
+        }
+    }
+
+    // 视频解码必须输出所有帧，否则丢帧会破坏参考帧链导致花屏。
+    ctx->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;
+    ctx->pkt_timebase = stream->time_base;
+
+    const int openRet = avcodec_open2(ctx, codec, nullptr);
+    if (openRet < 0) {
+        setError(error, std::string("打开解码器 ") + ((codec->name != nullptr) ? codec->name : "?") +
+                            " 失败: " + ffmpeg_error::toString(openRet));
+        avcodec_free_context(&ctx);
+        return nullptr;
+    }
+    return ctx;
 }
 
 bool Decoder::open(const AVStream* stream, PacketQueue* queue, std::string* error)
@@ -41,28 +145,29 @@ bool Decoder::open(const AVStream* stream, PacketQueue* queue, std::string* erro
     stop();
     close();
 
-    const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
-    if (codec == nullptr) {
-        return fail(std::string("找不到解码器: ") + avcodec_get_name(stream->codecpar->codec_id));
+    // ① 优先 NVIDIA 硬件解码：<编码名>_cuvid + CUDA 设备上下文。
+    const AVCodec* codec = findCuvidDecoder(stream->codecpar->codec_id);
+    std::string hwReason;
+    if (codec != nullptr) {
+        m_codecCtx = createContext(codec, stream, AV_HWDEVICE_TYPE_CUDA, &hwReason);
     }
 
-    m_codecCtx = avcodec_alloc_context3(codec);
+    // ② 设备不可用 / 驱动不支持该档次 / 未编译该解码器 → 回退软件解码，
+    //    而不是让整条管线启动失败。实际生效的解码器由 codecName() 暴露。
     if (m_codecCtx == nullptr) {
-        return fail("avcodec_alloc_context3 失败");
-    }
-
-    const int paramsRet = avcodec_parameters_to_context(m_codecCtx, stream->codecpar);
-    if (paramsRet < 0) {
-        return fail("复制解码参数失败: " + ffmpeg_error::toString(paramsRet));
-    }
-
-    // 视频解码必须输出所有帧，否则丢帧会破坏参考帧链导致花屏。
-    m_codecCtx->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;
-    m_codecCtx->pkt_timebase = stream->time_base;
-
-    const int openRet = avcodec_open2(m_codecCtx, codec, nullptr);
-    if (openRet < 0) {
-        return fail(std::string("打开解码器失败: ") + ffmpeg_error::toString(openRet));
+        codec = avcodec_find_decoder(stream->codecpar->codec_id);
+        if (codec == nullptr) {
+            return fail(std::string("找不到解码器: ") + avcodec_get_name(stream->codecpar->codec_id));
+        }
+        std::string swReason;
+        m_codecCtx = createContext(codec, stream, AV_HWDEVICE_TYPE_NONE, &swReason);
+        if (m_codecCtx == nullptr) {
+            std::string message = "打开解码器失败: " + swReason;
+            if (!hwReason.empty()) {
+                message += "（硬件解码不可用: " + hwReason + "）";
+            }
+            return fail(std::move(message));
+        }
     }
 
     m_timeBase = stream->time_base;
@@ -75,6 +180,8 @@ bool Decoder::open(const AVStream* stream, PacketQueue* queue, std::string* erro
 
 void Decoder::close()
 {
+    // 解码上下文同时负责释放它持有的硬件设备引用（avcodec_free_context 内部 unref），
+    // 因此硬件设备不需要单独的成员，也不存在漏释放的路径。
     if (m_codecCtx != nullptr) {
         avcodec_free_context(&m_codecCtx);
     }
@@ -167,64 +274,134 @@ bool Decoder::convertAndEmit(const AVFrame* source, std::string* error)
     // NV12 的 UV 平面是宽高各一半，故输出尺寸取偶数（与渲染控件 w/2、h/2 的假设一致）。
     const int dstWidth = source->width & ~1;
     const int dstHeight = source->height & ~1;
-
-    // sws_getCachedContext 在源尺寸/像素格式变化时自动重建，天然支持中途切换分辨率。
-    m_swsCtx = sws_getCachedContext(m_swsCtx,
-                                   source->width,
-                                   source->height,
-                                   static_cast<AVPixelFormat>(source->format),
-                                   dstWidth,
-                                   dstHeight,
-                                   AV_PIX_FMT_NV12,
-                                   SWS_BILINEAR,
-                                   nullptr,
-                                   nullptr,
-                                   nullptr);
-    if (m_swsCtx == nullptr) {
-        if (error != nullptr) {
-            *error = "创建像素格式转换上下文失败";
-        }
-        return false;
+    if (dstWidth < 2 || dstHeight < 2) {
+        return true;  // 退化尺寸构不成 NV12，跳过
     }
 
-    avframe::AVFrameHolder converted = avframe::create();
-    if (!converted) {
-        if (error != nullptr) {
-            *error = "av_frame_alloc 失败";
+    // ① 硬件帧（CUDA 等）的 data[] 是设备指针，先下载到主机内存：
+    //    直接按主机内存解释它（sws_scale / 纹理上传）只会得到垃圾或纯色画面。
+    avframe::AVFrameHolder downloaded;
+    const AVFrame* src = source;
+    if (isHardwareFrame(source)) {
+        downloaded = avframe::create();
+        if (!downloaded) {
+            setError(error, "av_frame_alloc 失败（硬件帧下载）");
+            return false;
         }
-        return false;
+        const int transferRet = av_hwframe_transfer_data(downloaded.get(), source, 0);
+        if (transferRet < 0) {
+            setError(error, "硬件帧下载到内存失败: " + ffmpeg_error::toString(transferRet));
+            return false;
+        }
+        // 下载后的格式由 AVHWFramesContext::sw_format 决定：8bit 4:2:0 → NV12，
+        // 10bit → P010，4:4:4 → YUV444P，因此必须按帧的**实际格式**分流，
+        // 而不是按"解码器是不是硬件"分流。
+        src = downloaded.get();
     }
-    converted->format = AV_PIX_FMT_NV12;
-    converted->width = dstWidth;
-    converted->height = dstHeight;
 
-    const int bufferRet = av_frame_get_buffer(converted.get(), 32);
-    if (bufferRet < 0) {
-        if (error != nullptr) {
-            *error = "分配输出帧缓冲失败: " + ffmpeg_error::toString(bufferRet);
+    const AVPixelFormat srcFormat = static_cast<AVPixelFormat>(src->format);
+    avframe::AVFrameHolder converted;
+
+    if (srcFormat == kOutputFormat) {
+        // ② 已经是目标格式：绝不能再交给 swscale 做"同格式同尺寸"转换。libswscale 在该
+        //    路径走只拷亮度的快速通道（NV12 的 data[2] 为空 → 色度平面被整片跳过），
+        //    输出帧的色度保持未初始化的 0；U=V=0 经 YUV→RGB 后红蓝通道被压到 0，
+        //    画面只剩随亮度变化的绿色 —— 即"整幅发绿、画面仍在动"。
+        if (src->width == dstWidth && src->height == dstHeight) {
+            if (src == downloaded.get()) {
+                converted = std::move(downloaded);  // 刚下载的帧：直接接管，零拷贝
+            } else {
+                converted = avframe::create();  // 解码器内部缓冲：只加引用，不拷像素
+                if (!converted) {
+                    setError(error, "av_frame_alloc 失败（复用解码帧）");
+                    return false;
+                }
+                const int refRet = av_frame_ref(converted.get(), src);
+                if (refRet < 0) {
+                    setError(error, "引用解码帧失败: " + ffmpeg_error::toString(refRet));
+                    return false;
+                }
+            }
+        } else {
+            // ③ 仅需把宽高裁成偶数：逐行裁剪拷贝，不做任何重采样。
+            converted = avframe::create();
+            if (!converted) {
+                setError(error, "av_frame_alloc 失败（尺寸裁剪）");
+                return false;
+            }
+            converted->format = kOutputFormat;
+            converted->width = dstWidth;
+            converted->height = dstHeight;
+            const int bufferRet = av_frame_get_buffer(converted.get(), kOutputAlign);
+            if (bufferRet < 0) {
+                setError(error, "分配输出帧缓冲失败: " + ffmpeg_error::toString(bufferRet));
+                return false;
+            }
+            // NV12 每行字节数：Y 平面 = 宽，UV 交错平面 = 2 × (宽/2) = 宽。
+            if (src->data[0] == nullptr || src->data[1] == nullptr || src->linesize[0] < dstWidth ||
+                src->linesize[1] < dstWidth) {
+                setError(error, "源 NV12 帧缺少色度平面或行宽不足");
+                return false;
+            }
+            av_image_copy_plane(converted->data[0], converted->linesize[0], src->data[0], src->linesize[0],
+                                dstWidth, dstHeight);
+            av_image_copy_plane(converted->data[1], converted->linesize[1], src->data[1], src->linesize[1],
+                                dstWidth, dstHeight / 2);
         }
-        return false;
+    } else {
+        // ④ 真正的格式转换（YUV420P / YUVJ* / P010 / YUV444P … → NV12）：swscale 此路径正常。
+        //    sws_getCachedContext 在源尺寸/像素格式变化时自动重建，天然支持中途切换分辨率。
+        m_swsCtx = sws_getCachedContext(m_swsCtx,
+                                        src->width,
+                                        src->height,
+                                        swscaleSourceFormat(srcFormat),
+                                        dstWidth,
+                                        dstHeight,
+                                        kOutputFormat,
+                                        SWS_BILINEAR,
+                                        nullptr,
+                                        nullptr,
+                                        nullptr);
+        if (m_swsCtx == nullptr) {
+            setError(error, "创建像素格式转换上下文失败");
+            return false;
+        }
+
+        converted = avframe::create();
+        if (!converted) {
+            setError(error, "av_frame_alloc 失败（像素格式转换）");
+            return false;
+        }
+        converted->format = kOutputFormat;
+        converted->width = dstWidth;
+        converted->height = dstHeight;
+        const int bufferRet = av_frame_get_buffer(converted.get(), kOutputAlign);
+        if (bufferRet < 0) {
+            setError(error, "分配输出帧缓冲失败: " + ffmpeg_error::toString(bufferRet));
+            return false;
+        }
+
+        const int scaled =
+            sws_scale(m_swsCtx, src->data, src->linesize, 0, src->height, converted->data, converted->linesize);
+        if (scaled <= 0) {
+            setError(error, "像素格式转换失败（sws_scale 返回 " + std::to_string(scaled) + "）");
+            return false;
+        }
     }
 
-    const int scaled = sws_scale(m_swsCtx,
-                                source->data,
-                                source->linesize,
-                                0,
-                                source->height,
-                                converted->data,
-                                converted->linesize);
-    if (scaled <= 0) {
-        if (error != nullptr) {
-            *error = "像素格式转换失败（sws_scale 返回 " + std::to_string(scaled) + "）";
-        }
+    // 出口不变量：NV12 必须有色度平面，且 UV 行字节数至少覆盖一整行。缺色度的帧在渲染端
+    // 只会显示成纯色，必须拦在这里，而不是跨线程把坏帧交给 UI。
+    if (!converted || converted->data[0] == nullptr || converted->data[1] == nullptr ||
+        converted->linesize[1] < dstWidth) {
+        setError(error, "规整后的 NV12 帧缺少色度平面或行宽不足");
         return false;
     }
 
     auto videoFrame = std::make_shared<avframe::VideoFrame>();
     videoFrame->width = dstWidth;
     videoFrame->height = dstHeight;
-    videoFrame->format = AV_PIX_FMT_NV12;
-    videoFrame->ptsSeconds = framePtsSeconds(source);
+    videoFrame->format = kOutputFormat;
+    videoFrame->ptsSeconds = framePtsSeconds(source);  // pts 取原始解码帧（下载产物不带属性）
     videoFrame->recvAt = m_lastRecvAt;
     videoFrame->decodedAt = std::chrono::steady_clock::now();
     videoFrame->frame = std::move(converted);

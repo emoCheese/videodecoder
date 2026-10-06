@@ -13,6 +13,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/frame.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/pixfmt.h>
 #include <libswscale/swscale.h>
 }
@@ -24,7 +25,11 @@ extern "C" {
 /// @brief 视频解码：编码包 → NV12 帧。
 ///
 /// 职责边界：
-///  - 只做"送包 → 取帧 → 转 NV12 → 回调"；
+///  - 只做"送包 → 取帧 → 转 NV12 → 回调"；有 NVIDIA 硬件解码器（<编码名>_cuvid）时优先
+///    使用，设备创建或打开失败则回退软件解码（硬件只是加速手段，不应让整条管线失败）；
+///  - 输出约定：NV12（UV 交错、宽高各半）+ 宽高偶数，与渲染控件 w/2、h/2 的假设一致。
+///    解码输出已经是 NV12 时不做任何转换：同格式同尺寸的 swscale 转换走的是"只拷亮度、
+///    不写色度"的快速通道，会让画面整幅发绿；只有真正的格式变更才允许走 swscale；
 ///  - 不拉流、不管网络、不拥有队列（队列由 Pipeline 拥有并负责 close/reset），
 ///    不触碰任何 Qt 对象。
 ///
@@ -77,6 +82,11 @@ public:
     [[nodiscard]] std::string codecName() const { return m_codecName; }
 
 private:
+    /// 装配解码器上下文：deviceType 非 NONE 时先创建该类型的硬件设备上下文并绑定。
+    /// 任一步失败都会清理干净（不留半开上下文）并返回 nullptr，error 可选回填原因。
+    [[nodiscard]] AVCodecContext* createContext(const AVCodec* codec, const AVStream* stream,
+                                                AVHWDeviceType deviceType, std::string* error);
+
     bool sendPacket(const AVPacket* packet, std::string* error);
     bool receiveFrames(std::string* error);
     bool convertAndEmit(const AVFrame* source, std::string* error);
@@ -85,6 +95,8 @@ private:
     [[nodiscard]] double framePtsSeconds(const AVFrame* frame) const noexcept;
 
     AVCodecContext* m_codecCtx = nullptr;
+    /// 像素格式转换上下文：只在"源格式 != NV12"的真实转换中使用，
+    /// 由 sws_getCachedContext 在源尺寸/格式变化时自动重建。
     SwsContext* m_swsCtx = nullptr;
     AVRational m_timeBase{0, 1};
     PacketQueue* m_queue = nullptr;  // 非拥有：队列生命周期归 Pipeline
