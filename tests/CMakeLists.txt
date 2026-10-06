@@ -1,6 +1,7 @@
 # 测试目标只依赖被测模块：
 #  - ringbuffer_test 只链接 DecoderPrimitives（不含 FFmpeg）
-#  - pipeline_smoke  链接 Decoder（公共头 Pipeline.h + PacketData.h）
+#  - framequeue_test  直接编入应用层的 framequeue.cpp，只借 Decoder 拿公共 DTO（PacketData.h）
+#  - pipeline_smoke   链接 Decoder（公共头 Pipeline.h + PacketData.h）
 
 # Sanitizer 运行环境（显式设置，避免依赖调用者手工 export）：
 #  - TSan：加载抑制文件（第三方 Qt/FFmpeg 未插桩产生的已知噪声），并继续跑完全部用例
@@ -19,6 +20,14 @@ add_executable(ringbuffer_test ringbuffer_test.cpp)
 target_link_libraries(ringbuffer_test PRIVATE DecoderPrimitives)
 add_test(NAME ringbuffer COMMAND ringbuffer_test)
 set_tests_properties(ringbuffer PROPERTIES TIMEOUT 60 ENVIRONMENT "${VD_TEST_ENV}")
+
+# FrameQueue 属于应用层（不在 Decoder 库里、也不依赖 Qt），因此直接把源码编进测试目标；
+# 链接 Decoder 只为拿到公共 DTO（PacketData.h）以及它需要的 FFmpeg 符号。
+add_executable(framequeue_test framequeue_test.cpp "${CMAKE_SOURCE_DIR}/framequeue.cpp")
+target_include_directories(framequeue_test PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(framequeue_test PRIVATE Decoder)
+add_test(NAME framequeue COMMAND framequeue_test)
+set_tests_properties(framequeue PROPERTIES TIMEOUT 60 ENVIRONMENT "${VD_TEST_ENV}")
 
 add_executable(pipeline_smoke pipeline_smoke.cpp)
 target_link_libraries(pipeline_smoke PRIVATE Decoder)

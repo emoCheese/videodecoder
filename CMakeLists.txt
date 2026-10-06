@@ -69,6 +69,8 @@ qt_add_executable(VideoDecoder
     mainwindow.cpp
     mainwindow.h
     mainwindow.ui
+    framequeue.cpp
+    framequeue.h
 )
 
 target_link_libraries(VideoDecoder

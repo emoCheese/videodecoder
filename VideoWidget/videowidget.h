@@ -17,6 +17,11 @@
 ///
 /// 渲染流程：onFrameReady() 只登记待显示帧并请求重绘；
 ///           paintGL() 里上传纹理并绘制，保证上下文已 current、同一帧只上传一次。
+///
+/// 上屏节拍（供应用层按 vsync 喂帧；控件自身不做任何队列/丢帧策略）：
+///  - framePending() == false 表示"上一帧已上传完，可以接收下一帧"；
+///  - 继承自 QOpenGLWidget 的 frameSwapped() 在每次合成/交换后发出，应用层以它为
+///    "本帧已被显示消耗"的节拍点紧接着喂下一帧（比固定周期定时器更贴合刷新率）。
 
 class VideoWidget : public QOpenGLWidget, protected QOpenGLFunctions_3_3_Core {
     Q_OBJECT
@@ -35,6 +40,8 @@ public:
 
     [[nodiscard]] double renderFps() const noexcept { return m_fps; }
     [[nodiscard]] bool hasFrame() const noexcept { return m_hasFrame; }
+    /// 是否已登记但尚未上传的一帧：为 true 时应用层不得再喂新帧（会被覆盖，等于丢一帧）。
+    [[nodiscard]] bool framePending() const noexcept { return m_frameDirty; }
     [[nodiscard]] int videoWidth() const noexcept { return m_videoWidth; }
     [[nodiscard]] int videoHeight() const noexcept { return m_videoHeight; }
     [[nodiscard]] bool glReady() const noexcept { return m_glReady; }
